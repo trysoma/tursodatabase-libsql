@@ -184,6 +184,7 @@ pub use self::{
     rows::{Column, Row, Rows},
     statement::Statement,
     transaction::{Transaction, TransactionBehavior},
+    rows::FromValue
 };
 
 /// Convenient alias for `Result` using the `libsql::Error` type.
