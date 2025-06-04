@@ -153,7 +153,7 @@ impl fmt::Debug for Row {
 }
 
 /// Convert a `Value` into the implementors type.
-pub trait FromValue: Sealed {
+pub trait FromValue {
     fn from_sql(val: Value) -> Result<Self>
     where
         Self: Sized;
