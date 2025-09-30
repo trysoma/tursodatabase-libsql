@@ -9,8 +9,9 @@ use tokio::sync::Mutex;
 
 pub struct SyncedStatement {
     pub conn: local::Connection,
-    pub context: Arc<Mutex<SyncContext>>,
     pub inner: Statement,
+    pub context: Arc<Mutex<SyncContext>>,
+    pub read_your_writes: bool,
 }
 
 #[async_trait::async_trait]
@@ -19,32 +20,38 @@ impl Stmt for SyncedStatement {
         self.inner.finalize()
     }
 
-    async fn execute(&mut self, params: &Params) -> Result<usize> {
+    async fn execute(&self, params: &Params) -> Result<usize> {
         let result = self.inner.execute(params).await;
-        let mut context = self.context.lock().await;
-        crate::sync::try_pull(&mut context, &self.conn).await?;
+        if self.read_your_writes {
+            let mut context = self.context.lock().await;
+            crate::sync::try_pull(&mut context, &self.conn).await?;
+        }
         result
     }
 
-    async fn query(&mut self, params: &Params) -> Result<Rows> {
+    async fn query(&self, params: &Params) -> Result<Rows> {
         let result = self.inner.query(params).await;
-        let mut context = self.context.lock().await;
-        crate::sync::try_pull(&mut context, &self.conn).await?;
+        if self.read_your_writes {
+            let mut context = self.context.lock().await;
+            crate::sync::try_pull(&mut context, &self.conn).await?;
+        }
         result
     }
 
-    async fn run(&mut self, params: &Params) -> Result<()> {
+    async fn run(&self, params: &Params) -> Result<()> {
         let result = self.inner.run(params).await;
-        let mut context = self.context.lock().await;
-        crate::sync::try_pull(&mut context, &self.conn).await?;
+        if self.read_your_writes {
+            let mut context = self.context.lock().await;
+            crate::sync::try_pull(&mut context, &self.conn).await?;
+        }
         result
     }
 
-    fn interrupt(&mut self) -> Result<()> {
+    fn interrupt(&self) -> Result<()> {
         self.inner.interrupt()
     }
 
-    fn reset(&mut self) {
+    fn reset(&self) {
         self.inner.reset()
     }
 
@@ -64,3 +71,4 @@ impl Stmt for SyncedStatement {
         self.inner.columns()
     }
 }
+

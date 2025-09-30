@@ -8,6 +8,8 @@ pub use builder::Builder;
 pub use libsql_sys::{Cipher, EncryptionConfig};
 
 use crate::{Connection, Result};
+#[cfg(any(feature = "remote", feature = "sync"))]
+use base64::{engine::general_purpose, Engine};
 use std::fmt;
 use std::sync::atomic::AtomicU64;
 
@@ -84,7 +86,7 @@ enum DbType {
         path: String,
         flags: OpenFlags,
         encryption_config: Option<EncryptionConfig>,
-        skip_saftey_assert: bool,
+        skip_safety_assert: bool,
     },
     #[cfg(feature = "replication")]
     Sync {
@@ -100,6 +102,7 @@ enum DbType {
         auth_token: String,
         connector: crate::util::ConnectorService,
         _bg_abort: Option<std::sync::Arc<crate::sync::DropAbort>>,
+        remote_encryption: Option<EncryptionContext>,
     },
     #[cfg(feature = "remote")]
     Remote {
@@ -108,6 +111,7 @@ enum DbType {
         connector: crate::util::ConnectorService,
         version: Option<String>,
         namespace: Option<String>,
+        remote_encryption: Option<EncryptionContext>,
     },
 }
 
@@ -166,7 +170,7 @@ cfg_core! {
                     path: db_path.into(),
                     flags,
                     encryption_config: None,
-                    skip_saftey_assert: false,
+                    skip_safety_assert: false,
                 },
                 max_write_replication_index: Default::default(),
             })
@@ -214,7 +218,7 @@ cfg_replication! {
                 endpoint,
                 auth_token,
                 https,
-                encryption_config
+                encryption_config,
             ).await
         }
 
@@ -458,7 +462,7 @@ cfg_replication! {
                DbType::Sync { db, .. } => {
                    let path = db.path().to_string();
                    Ok(Database {
-                       db_type: DbType::File { path, flags: OpenFlags::default(), encryption_config: None, skip_saftey_assert: false },
+                       db_type: DbType::File { path, flags: OpenFlags::default(), encryption_config: None, skip_safety_assert: false },
                        max_write_replication_index: Default::default(),
                    })
                }
@@ -524,7 +528,7 @@ cfg_remote! {
             url: impl Into<String>,
             auth_token: impl Into<String>,
             connector: C,
-            version: Option<String>
+            version: Option<String>,
         ) -> Result<Self>
         where
             C: tower::Service<http::Uri> + Send + Clone + Sync + 'static,
@@ -544,6 +548,7 @@ cfg_remote! {
                     connector: crate::util::ConnectorService::new(svc),
                     version,
                     namespace: None,
+                    remote_encryption: None
                 },
                 max_write_replication_index: Default::default(),
             })
@@ -580,11 +585,11 @@ impl Database {
                 path,
                 flags,
                 encryption_config,
-                skip_saftey_assert,
+                skip_safety_assert,
             } => {
                 use crate::local::impls::LibsqlConnection;
 
-                let db = if !skip_saftey_assert {
+                let db = if !skip_safety_assert {
                     crate::local::Database::open(path, *flags)?
                 } else {
                     unsafe { crate::local::Database::open_raw(path, *flags)? }
@@ -677,6 +682,7 @@ impl Database {
                 url,
                 auth_token,
                 connector,
+                remote_encryption,
                 ..
             } => {
                 use crate::{
@@ -685,17 +691,16 @@ impl Database {
                 };
                 use tokio::sync::Mutex;
 
-                let _ = tokio::task::block_in_place(move || {
+                tokio::task::block_in_place(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .unwrap();
                     rt.block_on(async {
-                        // we will ignore if any errors occurred during the bootstrapping the db,
-                        // because the client could be offline when trying to connect.
-                        let _ = db.bootstrap_db().await;
+                        db.bootstrap_db().await?;
+                        Ok::<(), crate::Error>(())
                     })
-                });
+                })?;
 
                 let local = db.connect()?;
 
@@ -708,6 +713,7 @@ impl Database {
                             connector.clone(),
                             None,
                             None,
+                            remote_encryption.clone(),
                         ),
                         read_your_writes: *read_your_writes,
                         context: db.sync_ctx.clone().unwrap(),
@@ -729,6 +735,7 @@ impl Database {
                 connector,
                 version,
                 namespace,
+                remote_encryption,
             } => {
                 let conn = std::sync::Arc::new(
                     crate::hrana::connection::HttpConnection::new_with_connector(
@@ -737,6 +744,7 @@ impl Database {
                         connector.clone(),
                         version.as_ref().map(|s| s.as_str()),
                         namespace.as_ref().map(|s| s.as_str()),
+                        remote_encryption.clone(),
                     ),
                 );
 
@@ -779,4 +787,30 @@ impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Database").finish()
     }
+}
+
+#[cfg(any(feature = "remote", feature = "sync"))]
+#[derive(Debug, Clone)]
+pub enum EncryptionKey {
+    /// The key is a base64-encoded string.
+    Base64Encoded(String),
+    /// The key is a byte array.
+    Bytes(Vec<u8>),
+}
+
+#[cfg(any(feature = "remote", feature = "sync"))]
+impl EncryptionKey {
+    pub fn as_string(&self) -> String {
+        match self {
+            EncryptionKey::Base64Encoded(s) => s.clone(),
+            EncryptionKey::Bytes(b) => general_purpose::STANDARD.encode(b),
+        }
+    }
+}
+
+#[cfg(any(feature = "remote", feature = "sync"))]
+#[derive(Debug, Clone)]
+pub struct EncryptionContext {
+    /// The base64-encoded key for the encryption, sent on every request.
+    pub key: EncryptionKey,
 }

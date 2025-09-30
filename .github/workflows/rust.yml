@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Run Checks
     env:
+      RUST_BACKTRACE: 1
       RUSTFLAGS: -D warnings --cfg tokio_unstable
     steps:
       - uses: hecrj/setup-rust-action@v2
@@ -129,6 +130,9 @@ jobs:
 
     - name: Run tests
       run: cargo nextest run
+
+    - name: Run libsql encryption tests
+      run: cargo test --features encryption --color=always --test encryption test_encryption
   # test-custom-pager:
   #   runs-on: ubuntu-latest
   #   name: Run Tests
@@ -179,6 +183,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Run Tests
     env:
+      RUST_BACKTRACE: 1
       RUSTFLAGS: -D warnings --cfg tokio_unstable
     steps:
     - uses: hecrj/setup-rust-action@v2

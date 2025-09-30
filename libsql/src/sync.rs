@@ -1,13 +1,14 @@
 use crate::{local::Connection, util::ConnectorService, Error, Result};
 
-use std::path::Path;
-
+use crate::database::EncryptionContext;
 use bytes::Bytes;
 use chrono::Utc;
 use http::{HeaderValue, StatusCode};
 use hyper::Body;
+use std::path::Path;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
+use zerocopy::big_endian;
 
 #[cfg(test)]
 mod test;
@@ -20,6 +21,7 @@ const METADATA_VERSION: u32 = 0;
 
 const DEFAULT_MAX_RETRIES: usize = 5;
 const DEFAULT_PUSH_BATCH_SIZE: u32 = 128;
+const DEFAULT_PULL_BATCH_SIZE: u32 = 128;
 
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
@@ -66,6 +68,10 @@ pub enum SyncError {
     InvalidLocalGeneration(u32, u32),
     #[error("invalid local state: {0}")]
     InvalidLocalState(String),
+    #[error("invalid remote state: {0}")]
+    InvalidRemoteState(String),
+    #[error("server returned invalid length of frames: {0}")]
+    InvalidPullFrameBytes(usize),
 }
 
 impl SyncError {
@@ -98,8 +104,8 @@ pub enum PushStatus {
 }
 
 pub enum PullResult {
-    /// A frame was successfully pulled.
-    Frame(Bytes),
+    /// Frames were successfully pulled.
+    Frames(Bytes),
     /// We've reached the end of the generation.
     EndOfGeneration { max_generation: u32 },
 }
@@ -122,6 +128,7 @@ pub struct SyncContext {
     auth_token: Option<HeaderValue>,
     max_retries: usize,
     push_batch_size: u32,
+    pull_batch_size: u32,
     /// The current durable generation.
     durable_generation: u32,
     /// Represents the max_frame_no from the server.
@@ -129,6 +136,8 @@ pub struct SyncContext {
     /// whenever sync is called very first time, we will call the remote server
     /// to get the generation information and sync the db file if needed
     initial_server_sync: bool,
+    /// The encryption context for the sync.
+    remote_encryption: Option<EncryptionContext>,
 }
 
 impl SyncContext {
@@ -137,6 +146,7 @@ impl SyncContext {
         db_path: String,
         sync_url: String,
         auth_token: Option<String>,
+        remote_encryption: Option<EncryptionContext>,
     ) -> Result<Self> {
         let client = hyper::client::Client::builder().build::<_, hyper::Body>(connector);
 
@@ -154,19 +164,14 @@ impl SyncContext {
             auth_token,
             max_retries: DEFAULT_MAX_RETRIES,
             push_batch_size: DEFAULT_PUSH_BATCH_SIZE,
+            pull_batch_size: DEFAULT_PULL_BATCH_SIZE,
             client,
             durable_generation: 0,
             durable_frame_num: 0,
             initial_server_sync: false,
+            remote_encryption,
         };
-
-        if let Err(e) = me.read_metadata().await {
-            tracing::error!(
-                "failed to read sync metadata file, resetting back to defaults: {}",
-                e
-            );
-        }
-
+        me.read_metadata().await?;
         Ok(me)
     }
 
@@ -175,7 +180,7 @@ impl SyncContext {
     }
 
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn pull_one_frame(
+    pub(crate) async fn pull_frames(
         &mut self,
         generation: u32,
         frame_no: u32,
@@ -185,9 +190,10 @@ impl SyncContext {
             self.sync_url,
             generation,
             frame_no,
-            frame_no + 1
+            // the server expects the range of [start, end) frames, i.e. end is exclusive
+            frame_no + self.pull_batch_size
         );
-        tracing::debug!("pulling frame");
+        tracing::debug!("pulling frame (uri={})", uri);
         self.pull_with_retry(uri, self.max_retries).await
     }
 
@@ -295,6 +301,10 @@ impl SyncContext {
                         .insert("Authorization", auth_token.clone());
                 }
                 None => {}
+            }
+
+            if let Some(remote_encryption) = &self.remote_encryption {
+                req = req.header("x-turso-encryption-key", remote_encryption.key.as_string());
             }
 
             let req = req.body(body.clone().into()).expect("valid body");
@@ -408,6 +418,10 @@ impl SyncContext {
                 None => {}
             }
 
+            if let Some(remote_encryption) = &self.remote_encryption {
+                req = req.header("x-turso-encryption-key", remote_encryption.key.as_string());
+            }
+
             let req = req.body(Body::empty()).expect("valid request");
 
             let res = self
@@ -417,20 +431,39 @@ impl SyncContext {
                 .map_err(SyncError::HttpDispatch)?;
 
             if res.status().is_success() {
-                let frame = hyper::body::to_bytes(res.into_body())
+                let frames = hyper::body::to_bytes(res.into_body())
                     .await
                     .map_err(SyncError::HttpBody)?;
-                return Ok(PullResult::Frame(frame));
+                // a success result should always return some frames
+                if frames.is_empty() {
+                    tracing::error!("server returned empty frames in pull response");
+                    return Err(SyncError::InvalidPullFrameBytes(0).into());
+                }
+                // the minimum payload size cannot be less than a single frame
+                if frames.len() < FRAME_SIZE {
+                    tracing::error!(
+                        "server returned frames with invalid length: {} < {}",
+                        frames.len(),
+                        FRAME_SIZE
+                    );
+                    return Err(SyncError::InvalidPullFrameBytes(frames.len()).into());
+                }
+                return Ok(PullResult::Frames(frames));
             }
             // BUG ALERT: The server returns a 500 error if the remote database is empty.
             // This is a bug and should be fixed.
             if res.status() == StatusCode::BAD_REQUEST
                 || res.status() == StatusCode::INTERNAL_SERVER_ERROR
             {
+                let status = res.status();
                 let res_body = hyper::body::to_bytes(res.into_body())
                     .await
                     .map_err(SyncError::HttpBody)?;
-
+                tracing::trace!(
+                    "server returned: {} body: {}",
+                    status,
+                    String::from_utf8_lossy(&res_body[..])
+                );
                 let resp = serde_json::from_slice::<serde_json::Value>(&res_body[..])
                     .map_err(SyncError::JsonDecode)?;
 
@@ -491,6 +524,8 @@ impl SyncContext {
     pub(crate) async fn write_metadata(&mut self) -> Result<()> {
         let path = format!("{}-info", self.db_path);
 
+        assert!(self.durable_generation > 0);
+
         let mut metadata = MetadataJson {
             hash: 0,
             version: METADATA_VERSION,
@@ -537,6 +572,10 @@ impl SyncContext {
             metadata
         );
 
+        if metadata.generation == 0 {
+            return Err(SyncError::InvalidLocalState("generation is 0".to_string()).into());
+        }
+
         self.durable_generation = metadata.generation;
         self.durable_frame_num = metadata.durable_frame_num;
 
@@ -550,6 +589,10 @@ impl SyncContext {
 
         if let Some(auth_token) = &self.auth_token {
             req = req.header("Authorization", auth_token);
+        }
+
+        if let Some(remote_encryption) = &self.remote_encryption {
+            req = req.header("x-turso-encryption-key", remote_encryption.key.as_string());
         }
 
         let req = req.body(Body::empty()).expect("valid request");
@@ -574,12 +617,21 @@ impl SyncContext {
             .await
             .map_err(SyncError::HttpBody)?;
 
-        let info = serde_json::from_slice(&body).map_err(SyncError::JsonDecode)?;
-
+        let info: InfoResult = serde_json::from_slice(&body).map_err(SyncError::JsonDecode)?;
+        if info.current_generation == 0 {
+            return Err(SyncError::InvalidRemoteState("generation is 0".to_string()).into());
+        }
         Ok(info)
     }
 
-    async fn sync_db_if_needed(&mut self, generation: u32) -> Result<()> {
+    async fn sync_db_if_needed(&mut self) -> Result<()> {
+        let db_file_exists = check_if_file_exists(&self.db_path)?;
+        let metadata_exists = check_if_file_exists(&format!("{}-info", self.db_path))?;
+        if db_file_exists && metadata_exists {
+            return Ok(());
+        }
+        let info = self.get_remote_info().await?;
+        let generation = info.current_generation;
         // somehow we are ahead of the remote in generations. following should not happen because
         // we checkpoint only if the remote server tells us to do so.
         if self.durable_generation > generation {
@@ -599,8 +651,6 @@ impl SyncContext {
         //    then local db is in an incorrect state. we stop and return with an error
         // 3. if the db file exists and the metadata file exists, then we don't need to do the
         //    sync
-        let metadata_exists = check_if_file_exists(&format!("{}-info", self.db_path))?;
-        let db_file_exists = check_if_file_exists(&self.db_path)?;
         match (metadata_exists, db_file_exists) {
             (false, false) => {
                 // neither the db file nor the metadata file exists, lets bootstrap from remote
@@ -611,16 +661,14 @@ impl SyncContext {
                 self.sync_db(generation).await
             }
             (false, true) => {
-                // kinda inconsistent state: DB exists but metadata missing
-                // however, this generally not an issue. For a fresh db, a user might do writes
-                // locally and then try to do sync later. So in this case, we will not
-                // bootstrap the db file and let the user proceed. If it is not a fresh db, the
-                // push will fail anyways later.
-                // if metadata file does not exist, then generation should be zero
-                assert_eq!(self.durable_generation, 0);
-                // lets initialise it to first generation
-                self.durable_generation = 1;
-                Ok(())
+                // inconsistent state: DB exists but metadata missing
+                tracing::error!(
+                    "local state is incorrect, db file exists but metadata file does not"
+                );
+                Err(SyncError::InvalidLocalState(
+                    "db file exists but metadata file does not".to_string(),
+                )
+                .into())
             }
             (true, false) => {
                 // inconsistent state: Metadata exists but DB missing
@@ -633,8 +681,8 @@ impl SyncContext {
                 .into())
             }
             (true, true) => {
-                // both files exists, no need to sync
-                Ok(())
+                // We already handled this case earlier in the function.
+                unreachable!();
             }
         }
     }
@@ -648,23 +696,39 @@ impl SyncContext {
             req = req.header("Authorization", auth_token);
         }
 
+        if let Some(remote_encryption) = &self.remote_encryption {
+            req = req.header("x-turso-encryption-key", remote_encryption.key.as_string());
+        }
+
         let req = req.body(Body::empty()).expect("valid request");
 
-        let res = self
-            .client
-            .request(req)
-            .await
-            .map_err(SyncError::HttpDispatch)?;
+        let (res, http_duration) =
+            crate::replication::remote_client::time(self.client.request(req)).await;
+        let res = res.map_err(SyncError::HttpDispatch)?;
 
         if !res.status().is_success() {
             let status = res.status();
             let body = hyper::body::to_bytes(res.into_body())
                 .await
                 .map_err(SyncError::HttpBody)?;
+            tracing::error!(
+                "failed to pull db file from remote server, status={}, body={}, url={}, duration={:?}",
+                status,
+                String::from_utf8_lossy(&body),
+                uri,
+                http_duration
+            );
             return Err(
                 SyncError::PullFrame(status, String::from_utf8_lossy(&body).to_string()).into(),
             );
         }
+
+        tracing::debug!(
+            "pulled db file from remote server, status={}, url={}, duration={:?}",
+            res.status(),
+            uri,
+            http_duration
+        );
 
         // todo: do streaming write to the disk
         let bytes = hyper::body::to_bytes(res.into_body())
@@ -762,11 +826,7 @@ pub async fn bootstrap_db(sync_ctx: &mut SyncContext) -> Result<()> {
     // we need to do this when we notice a large gap in generations, when bootstrapping is cheaper
     // than pulling each frame
     if !sync_ctx.initial_server_sync {
-        // sync is being called first time. so we will call remote, get the generation information
-        // if we are lagging behind, then we will call the export API and get to the latest
-        // generation directly.
-        let info = sync_ctx.get_remote_info().await?;
-        sync_ctx.sync_db_if_needed(info.current_generation).await?;
+        sync_ctx.sync_db_if_needed().await?;
         // when sync_ctx is initialised, we set durable_generation to 0. however, once
         // sync_db is called, it should be > 0.
         assert!(sync_ctx.durable_generation > 0, "generation should be > 0");
@@ -887,66 +947,107 @@ async fn try_push(
     })
 }
 
+/// PAGE_SIZE used by the sync / diskless server
+const PAGE_SIZE: usize = 4096;
+const FRAME_HEADER_SIZE: usize = 24;
+const FRAME_SIZE: usize = PAGE_SIZE + FRAME_HEADER_SIZE;
+
 pub async fn try_pull(
     sync_ctx: &mut SyncContext,
     conn: &Connection,
 ) -> Result<crate::database::Replicated> {
-    let insert_handle = conn.wal_insert_handle()?;
+    // note, that updates of durable_frame_num are valid only after SQLite commited the WAL
+    // (because if WAL has uncommited suffix - it will be omitted by any other SQLite connection - for example after restart)
+    // so, try_pull maintains local next_frame_no during the pull operation and update durable_frame_num when it's appropriate
+    let mut next_frame_no = sync_ctx.durable_frame_num + 1;
 
-    let mut err = None;
+    // libsql maintain consistent state about WAL sync session locally in the insert_handle
+    // note, that insert_handle will always close the session on drop - so we never keep active WAL session after we exit from the method
+    let insert_handle = conn.wal_insert_handle();
 
     loop {
+        // get current generation (it may be updated multiple times during execution)
         let generation = sync_ctx.durable_generation();
-        let frame_no = sync_ctx.durable_frame_num() + 1;
-        match sync_ctx.pull_one_frame(generation, frame_no).await {
-            Ok(PullResult::Frame(frame)) => {
-                insert_handle.insert(&frame)?;
-                sync_ctx.durable_frame_num = frame_no;
+
+        match sync_ctx.pull_frames(generation, next_frame_no).await {
+            Ok(PullResult::Frames(frames)) => {
+                tracing::debug!(
+                    "pull_frames: generation={}, start_frame={} (end_frame={}, batch_size={}), frames_size={}",
+                    generation, next_frame_no, next_frame_no + sync_ctx.pull_batch_size, sync_ctx.pull_batch_size, frames.len(),
+                );
+                if frames.len() % FRAME_SIZE != 0 {
+                    tracing::error!(
+                        "frame size {} is not a multiple of the expected size {}",
+                        frames.len(),
+                        FRAME_SIZE,
+                    );
+                    return Err(SyncError::InvalidPullFrameBytes(frames.len()).into());
+                }
+                for chunk in frames.chunks(FRAME_SIZE) {
+                    let mut size_after_buf = [0u8; 4];
+                    size_after_buf.copy_from_slice(&chunk[4..8]);
+                    let size_after = big_endian::U32::from_bytes(size_after_buf);
+                    // start WAL sync session if it was closed
+                    // (this can happen if on previous iteration client received commit frame)
+                    if !insert_handle.in_session() {
+                        tracing::debug!(
+                            "pull_frames: generation={}, frame={}, start wal transaction session",
+                            generation,
+                            next_frame_no
+                        );
+                        insert_handle.begin()?;
+                    }
+                    let result = insert_handle.insert_at(next_frame_no, &chunk);
+                    if let Err(e) = result {
+                        tracing::error!("insert error (frame={}) : {:?}", next_frame_no, e);
+                        return Err(e);
+                    }
+                    // if this is commit frame - we can close WAL sync session and update durable_frame_num
+                    if size_after.get() > 0 {
+                        tracing::debug!(
+                            "pull_frames: generation={}, frame={}, finish wal transaction session, size_after={}",
+                            generation,
+                            next_frame_no,
+                            size_after.get()
+                        );
+                        insert_handle.end()?;
+                        sync_ctx.durable_frame_num = next_frame_no;
+                        sync_ctx.write_metadata().await?;
+                    }
+
+                    next_frame_no += 1;
+                }
             }
             Ok(PullResult::EndOfGeneration { max_generation }) => {
                 // If there are no more generations to pull, we're done.
                 if generation >= max_generation {
                     break;
                 }
-                insert_handle.end()?;
-                sync_ctx.write_metadata().await?;
+                assert!(
+                    !insert_handle.in_session(),
+                    "WAL transaction must be finished"
+                );
 
+                tracing::debug!(
+                    "pull_frames: generation={}, frame={}, checkpoint in order to move to next generation",
+                    generation,
+                    next_frame_no
+                );
                 // TODO: Make this crash-proof.
                 conn.wal_checkpoint(true)?;
 
                 sync_ctx.next_generation();
                 sync_ctx.write_metadata().await?;
-
-                insert_handle.begin()?;
+                next_frame_no = 1;
             }
-            Err(e) => {
-                tracing::debug!("pull_one_frame error: {:?}", e);
-                err.replace(e);
-                break;
-            }
+            Err(e) => return Err(e),
         }
     }
-    // This is crash-proof because we:
-    //
-    // 1. Write WAL frame first
-    // 2. Write new max frame to temporary metadata
-    // 3. Atomically rename the temporary metadata to the real metadata
-    //
-    // If we crash before metadata rename completes, the old metadata still
-    // points to last successful frame, allowing safe retry from that point.
-    // If we happen to have the frame already in the WAL, it's fine to re-pull
-    // because append locally is idempotent.
-    insert_handle.end()?;
-    sync_ctx.write_metadata().await?;
 
-    if let Some(err) = err {
-        Err(err)
-    } else {
-        Ok(crate::database::Replicated {
-            frame_no: None,
-            frames_synced: 1,
-        })
-    }
+    Ok(crate::database::Replicated {
+        frame_no: None,
+        frames_synced: 1,
+    })
 }
 
 fn check_if_file_exists(path: &str) -> core::result::Result<bool, SyncError> {

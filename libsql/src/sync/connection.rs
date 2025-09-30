@@ -89,7 +89,7 @@ impl SyncedConnection {
                 _ => {
                     *state = predicted_end_state;
                     false
-                },
+                }
             };
 
             Ok(should_execute_local)
@@ -100,7 +100,7 @@ impl SyncedConnection {
 #[async_trait::async_trait]
 impl Conn for SyncedConnection {
     async fn execute(&self, sql: &str, params: Params) -> Result<u64> {
-        let mut stmt = self.prepare(sql).await?;
+        let stmt = self.prepare(sql).await?;
         stmt.execute(params).await.map(|v| v as u64)
     }
 
@@ -108,7 +108,12 @@ impl Conn for SyncedConnection {
         if self.should_execute_local(sql).await? {
             self.local.execute_batch(sql)
         } else {
-            self.remote.execute_batch(sql).await
+            let result = self.remote.execute_batch(sql).await;
+            if self.read_your_writes {
+                let mut context = self.context.lock().await;
+                crate::sync::try_pull(&mut context, &self.local).await?;
+            }
+            result
         }
     }
 
@@ -117,7 +122,12 @@ impl Conn for SyncedConnection {
             self.local.execute_transactional_batch(sql)?;
             Ok(BatchRows::empty())
         } else {
-            self.remote.execute_transactional_batch(sql).await
+            let result = self.remote.execute_transactional_batch(sql).await;
+            if self.read_your_writes {
+                let mut context = self.context.lock().await;
+                crate::sync::try_pull(&mut context, &self.local).await?;
+            }
+            result
         }
     }
 
@@ -131,17 +141,14 @@ impl Conn for SyncedConnection {
                 inner: Box::new(self.remote.prepare(sql).await?),
             };
 
-            if self.read_your_writes {
-                Ok(Statement {
-                    inner: Box::new(SyncedStatement {
-                        conn: self.local.clone(),
-                        context: self.context.clone(),
-                        inner: stmt,
-                    }),
-                })
-            } else {
-                Ok(stmt)
-            }
+            Ok(Statement {
+                inner: Box::new(SyncedStatement {
+                    conn: self.local.clone(),
+                    inner: stmt,
+                    context: self.context.clone(),
+                    read_your_writes: self.read_your_writes,
+                }),
+            })
         }
     }
 

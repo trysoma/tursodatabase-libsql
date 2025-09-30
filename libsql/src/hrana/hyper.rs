@@ -27,6 +27,8 @@ pub struct HttpSender {
     inner: hyper::Client<ConnectorService, hyper::Body>,
     version: HeaderValue,
     namespace: Option<HeaderValue>,
+    #[cfg(any(feature = "remote", feature = "sync"))]
+    remote_encryption: Option<crate::database::EncryptionContext>,
 }
 
 impl HttpSender {
@@ -34,6 +36,9 @@ impl HttpSender {
         connector: ConnectorService,
         version: Option<&str>,
         namespace: Option<&str>,
+        #[cfg(any(feature = "remote", feature = "sync"))] remote_encryption: Option<
+            crate::database::EncryptionContext,
+        >,
     ) -> Self {
         let ver = version.unwrap_or(env!("CARGO_PKG_VERSION"));
 
@@ -41,11 +46,12 @@ impl HttpSender {
         let namespace = namespace.map(|v| HeaderValue::try_from(v).unwrap());
 
         let inner = hyper::Client::builder().build(connector);
-
         Self {
             inner,
             version,
             namespace,
+            #[cfg(any(feature = "remote", feature = "sync"))]
+            remote_encryption,
         }
     }
 
@@ -61,6 +67,12 @@ impl HttpSender {
 
         if let Some(namespace) = self.namespace {
             req_builder = req_builder.header("x-namespace", namespace);
+        }
+
+        #[cfg(any(feature = "remote", feature = "sync"))]
+        if let Some(remote_encryption) = &self.remote_encryption {
+            req_builder =
+                req_builder.header("x-turso-encryption-key", remote_encryption.key.as_string());
         }
 
         let req = req_builder
@@ -126,8 +138,17 @@ impl HttpConnection<HttpSender> {
         connector: ConnectorService,
         version: Option<&str>,
         namespace: Option<&str>,
+        #[cfg(any(feature = "remote", feature = "sync"))] remote_encryption: Option<
+            crate::database::EncryptionContext,
+        >,
     ) -> Self {
-        let inner = HttpSender::new(connector, version, namespace);
+        let inner = HttpSender::new(
+            connector,
+            version,
+            namespace,
+            #[cfg(any(feature = "remote", feature = "sync"))]
+            remote_encryption,
+        );
         Self::new(url.into(), token.into(), inner)
     }
 }
@@ -216,25 +237,25 @@ impl Conn for HttpConnection<HttpSender> {
 impl crate::statement::Stmt for crate::hrana::Statement<HttpSender> {
     fn finalize(&mut self) {}
 
-    async fn execute(&mut self, params: &Params) -> crate::Result<usize> {
+    async fn execute(&self, params: &Params) -> crate::Result<usize> {
         self.execute(params).await
     }
 
-    async fn query(&mut self, params: &Params) -> crate::Result<Rows> {
+    async fn query(&self, params: &Params) -> crate::Result<Rows> {
         self.query(params).await
     }
 
-    async fn run(&mut self, params: &Params) -> crate::Result<()> {
+    async fn run(&self, params: &Params) -> crate::Result<()> {
         self.run(params).await
     }
 
-    fn interrupt(&mut self) -> crate::Result<()> {
+    fn interrupt(&self) -> crate::Result<()> {
         Err(crate::Error::Misuse(
             "interrupt is not supported for remote connections".to_string(),
         ))
     }
 
-    fn reset(&mut self) {}
+    fn reset(&self) {}
 
     fn parameter_count(&self) -> usize {
         let stmt = &self.inner;
