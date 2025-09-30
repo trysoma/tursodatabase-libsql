@@ -689,18 +689,26 @@ impl Database {
                     hrana::connection::HttpConnection, local::impls::LibsqlConnection,
                     replication::connection::State, sync::connection::SyncedConnection,
                 };
-                use tokio::sync::Mutex;
+                use tokio::{runtime::RuntimeFlavor, sync::Mutex};
 
-                tokio::task::block_in_place(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    rt.block_on(async {
-                        db.bootstrap_db().await?;
-                        Ok::<(), crate::Error>(())
-                    })
-                })?;
+                match tokio::runtime::Handle::current().runtime_flavor() {
+                    RuntimeFlavor::CurrentThread => {
+                        // synchronous wait on current-thread runtime
+                        let sync_ctx_clone = db.sync_ctx.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let mut sync_ctx = sync_ctx_clone.as_ref().unwrap().lock().await;
+                                crate::sync::bootstrap_db(&mut sync_ctx).await.ok();
+                            }
+                        });
+                    }
+                    RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(move || {
+                            tokio::runtime::Handle::current().block_on(db.bootstrap_db()).ok();
+                        });
+                    }
+                    _ => unreachable!("only current-thread and multi-thread runtimes are supported"),
+                }
 
                 let local = db.connect()?;
 
